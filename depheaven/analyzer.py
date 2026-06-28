@@ -9,23 +9,32 @@ from .languages.base import AnalysisResult, DependencyInfo, DependencyInsight
 from .registry import pypi_latest, npm_latest
 
 
-# Known breaking change notes keyed by (package_name, from_major)
 BREAKING_CHANGES: dict[tuple[str, str], str] = {
     ("django", "2"): "Django 2→3: url() removed, use path()/re_path()",
-    ("django", "3"): "Django 3→4: ugettext() removed, use gettext(); DEFAULT_AUTO_FIELD required",
-    ("flask", "1"): "Flask 1→2: before_first_request removed; Blueprints need name param",
-    ("sqlalchemy", "1"): "SQLAlchemy 1→2: Session.execute() API changed; legacy Query style removed",
-    ("pydantic", "1"): "Pydantic v1→v2: .dict()→.model_dump(), .json()→.model_json(), validators rewritten",
-    ("numpy", "1"): "NumPy 1→2: np.bool/np.int/np.float aliases removed; use built-in types",
-    ("celery", "4"): "Celery 4→5: task_always_eager removed; result backend API changed",
-    ("pytest", "6"): "pytest 6→7: warns() match required; tmp_path_retention_count added",
-    ("react", "17"): "React 17→18: createRoot() replaces ReactDOM.render(); concurrent mode default",
-    ("react", "16"): "React 16→17: no new features; prepares for concurrent mode",
-    ("webpack", "4"): "Webpack 4→5: require.extensions removed; output.futureEmitAssets removed",
-    ("express", "4"): "Express 4→5: path params allow optional {}; res.redirect() always absolute",
-    ("axios", "0"): "Axios 0.x→1.x: default JSON serialization changed; CanceledError renamed",
-    ("vue", "2"): "Vue 2→3: createApp() replaces new Vue(); $on/$off/$once removed",
-    ("lodash", "3"): "Lodash 3→4: _.pluck removed, use _.map; _.any→_.some; _.all→_.every",
+    ("django", "3"): "Django 3→4: ugettext() removed, use gettext()",
+    ("django", "4"): "Django 4→5: index_together deprecated; CSRF changes",
+    ("flask", "1"): "Flask 1→2: before_first_request removed",
+    ("flask", "2"): "Flask 2→3: FLASK_ENV removed; helpers restructured",
+    ("sqlalchemy", "1"): "SQLAlchemy 1→2: Session.execute() API changed; Query removed",
+    ("pydantic", "1"): "Pydantic v1→v2: .dict()→.model_dump(); validators rewritten",
+    ("numpy", "1"): "NumPy 1→2: np.bool/np.int/np.float aliases removed",
+    ("pandas", "1"): "Pandas 1→2: DataFrame.append() removed; use pd.concat()",
+    ("celery", "4"): "Celery 4→5: task_always_eager removed",
+    ("pytest", "6"): "pytest 6→7: warns() match required",
+    ("pytest", "7"): "pytest 7→8: --strict removed; use --strict-markers",
+    ("react", "16"): "React 16→17: lifecycle method renames (UNSAFE_ prefix)",
+    ("react", "17"): "React 17→18: ReactDOM.render() → createRoot().render()",
+    ("react", "18"): "React 18→19: forwardRef deprecated; ref as prop",
+    ("webpack", "4"): "Webpack 4→5: asset modules built-in; require.extensions removed",
+    ("express", "4"): "Express 4→5: app.del() → app.delete(); req.param() removed",
+    ("vue", "2"): "Vue 2→3: new Vue() → createApp(); $on/$off removed",
+    ("axios", "0"): "Axios 0.x→1.x: Cancel → CanceledError; CancelToken deprecated",
+    ("next", "12"): "Next.js 12→13: Image layout prop removed; Link no longer needs <a>",
+    ("next", "13"): "Next.js 13→14: experimental.appDir removed; @next/font moved",
+    ("lodash", "3"): "Lodash 3→4: _.pluck/_.any/_.all/_.contains removed",
+    ("tailwindcss", "2"): "Tailwind 2→3: purge: → content:; JIT is now default",
+    ("marshmallow", "2"): "marshmallow 2→3: dump/load no longer return (data,errors) tuples",
+    ("attrs", "19"): "attrs 19→20: attr.ib() → attr.field(); @attr.s → @attr.define",
 }
 
 
@@ -54,7 +63,7 @@ def _check_breaking(dep: DependencyInfo, language: str) -> tuple[bool, Optional[
         if notes:
             return True, notes
         if int(lat_major) > int(cur_major):
-            return True, f"Major version bump {cur_major}→{lat_major}: review changelog for breaking changes"
+            return True, f"Major version bump {cur_major}→{lat_major}: review changelog"
     except (ValueError, IndexError):
         pass
     return False, None
@@ -64,22 +73,19 @@ def _enrich_with_insights(
     result: AnalysisResult,
     source: str,
     language: str,
-    deep: bool = False,
 ) -> None:
-    """Fetch changelogs and apply codemods for deps that have upgrades."""
+    """
+    For each dep that has an upgrade available:
+    1. Fetch real changelog from PyPI/GitHub (public API, no auth)
+    2. Parse it with changelog_parser to extract structured breaking changes
+    3. Scan the source file to find actual usages of affected APIs
+    4. Apply AST/regex codemods where possible
+    5. Record precise, line-level findings
+    """
     from .changelog import pypi_changelog, npm_changelog
+    from .changelog_parser import parse as parse_changelog, format_parsed
     from .codemods import apply_codemods
-
-    use_ollama = False
-    ollama_model = None
-    if deep:
-        try:
-            from . import ollama_client
-            if ollama_client.is_available():
-                use_ollama = True
-                ollama_model = ollama_client.best_model()
-        except Exception:
-            pass
+    from .usage_scanner import scan_usages, match_usages_to_changes
 
     current_source = source
     insights: list[DependencyInsight] = []
@@ -98,72 +104,67 @@ def _enrich_with_insights(
             to_version=dep.latest_version,
         )
 
-        # 1. Fetch changelog text from public APIs (no auth)
+        # 1. Fetch changelog
         changelog_text: Optional[str] = None
         try:
             if "python" in language.lower():
                 changelog_text = pypi_changelog(dep.name, dep.current_version, dep.latest_version)
-            elif "javascript" in language.lower() or "typescript" in language.lower():
+            else:
                 changelog_text = npm_changelog(dep.name, dep.current_version, dep.latest_version)
         except Exception:
             pass
 
-        # 2. Ask Ollama to summarize (only when --deep and Ollama is running)
-        if changelog_text and use_ollama:
+        # 2. Parse changelog structurally (no LLM)
+        if changelog_text:
             try:
-                from . import ollama_client
-                analysis = ollama_client.analyze_changelog(
-                    dep.name,
-                    dep.current_version,
-                    dep.latest_version,
-                    changelog_text,
-                    model=ollama_model,
+                parsed = parse_changelog(
+                    changelog_text, dep.name,
+                    dep.current_version, dep.latest_version,
                 )
-                insight.changelog_summary = analysis.get("summary")
-                insight.api_changes = analysis.get("api_changes", [])
-                insight.migration_steps = analysis.get("migration_steps", [])
-                insight.ollama_used = True
-                if analysis.get("breaking"):
+                formatted = format_parsed(parsed)
+                if formatted:
+                    insight.changelog_summary = "\n".join(formatted)
+
+                all_changes = parsed.all_changes
+                insight.api_changes = [c.description for c in all_changes[:10]]
+                insight.migration_steps = parsed.migration_hints[:5]
+
+                # Escalate breaking flag if changelog confirms it
+                if parsed.has_breaking and not dep.has_breaking_changes:
                     dep.has_breaking_changes = True
-                if insight.api_changes and not dep.breaking_change_notes:
-                    dep.breaking_change_notes = "; ".join(insight.api_changes[:3])
+                    if not dep.breaking_change_notes and insight.api_changes:
+                        dep.breaking_change_notes = insight.api_changes[0]
+
+                # 3. Scan source for actual usages of affected APIs
+                if all_changes:
+                    usages = scan_usages(current_source, language, dep.name)
+                    hits = match_usages_to_changes(usages, all_changes)
+                    for usage, change in hits:
+                        insight.codemod_changes.append(
+                            f"[line {usage.line}] You use `{usage.symbol}` — "
+                            f"{change.description}"
+                            + (f" → use `{change.new_api}`" if change.new_api else "")
+                        )
             except Exception:
                 pass
 
-        # 3. Apply AST/regex codemods — always, no LLM needed
+        # 4. Apply AST/regex codemods
         try:
             new_source, codemod_changes = apply_codemods(
                 current_source, language, dep.name,
                 dep.current_version, dep.latest_version,
             )
             if codemod_changes:
-                insight.codemod_changes = codemod_changes
+                insight.codemod_changes = codemod_changes + insight.codemod_changes
                 current_source = new_source
         except Exception:
             pass
-
-        # 4. Ask Ollama for a code suggestion when codemods didn't cover it
-        if use_ollama and insight.api_changes and not insight.codemod_changes:
-            try:
-                from . import ollama_client
-                lines = current_source.splitlines()
-                start = max(0, (dep.import_line or 1) - 3)
-                snippet = "\n".join(lines[start:start + 20])
-                fixed = ollama_client.suggest_code_fix(
-                    snippet, dep.name, insight.api_changes, language, model=ollama_model
-                )
-                if fixed:
-                    insight.codemod_changes.append(
-                        f"Ollama suggested rewrite for lines around {dep.import_line or '?'}"
-                    )
-            except Exception:
-                pass
 
         insights.append(insight)
 
     result.insights = insights
 
-    # Write codemod changes back to file
+    # Write codemod changes back to file if anything changed
     if current_source != source and result.file_path.exists():
         result.file_path.write_text(current_source, encoding="utf-8")
 
@@ -171,14 +172,8 @@ def _enrich_with_insights(
 def analyze_file(
     file_path: Path,
     offline: bool = False,
-    deep: bool = False,
 ) -> AnalysisResult:
-    """Analyze a single file for dependency issues.
-
-    Args:
-        offline: Skip all network requests.
-        deep: Enable Ollama-powered changelog analysis + code suggestions.
-    """
+    """Analyze a single file for dependency issues."""
     analyzer = get_analyzer(file_path)
     if analyzer is None:
         return AnalysisResult(
@@ -240,7 +235,7 @@ def analyze_file(
     )
 
     if not offline:
-        _enrich_with_insights(result, source, analyzer.language, deep=deep)
+        _enrich_with_insights(result, source, analyzer.language)
 
     return result
 
@@ -249,7 +244,6 @@ def analyze_directory(
     directory: Path,
     offline: bool = False,
     recursive: bool = True,
-    deep: bool = False,
 ) -> list[AnalysisResult]:
     """Analyze all supported source files in a directory."""
     from .languages import EXTENSION_MAP
@@ -269,8 +263,6 @@ def analyze_directory(
         }
         if any(part in skip_dirs for part in parts):
             continue
-
-        result = analyze_file(file_path, offline=offline, deep=deep)
-        results.append(result)
+        results.append(analyze_file(file_path, offline=offline))
 
     return results
