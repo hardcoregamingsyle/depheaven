@@ -37,6 +37,19 @@ class DependencyInfo:
 
 
 @dataclass
+class DependencyInsight:
+    """Changelog-derived intelligence for a single dependency upgrade."""
+    package: str
+    from_version: str
+    to_version: str
+    changelog_summary: Optional[str] = None      # human-readable summary
+    api_changes: list[str] = field(default_factory=list)
+    migration_steps: list[str] = field(default_factory=list)
+    codemod_changes: list[str] = field(default_factory=list)  # changes already applied
+    ollama_used: bool = False
+
+
+@dataclass
 class AnalysisResult:
     """Result of analyzing a file or directory."""
     file_path: Path
@@ -44,6 +57,7 @@ class AnalysisResult:
     dependencies: list[DependencyInfo] = field(default_factory=list)
     manifest_path: Optional[Path] = None
     errors: list[str] = field(default_factory=list)
+    insights: list[DependencyInsight] = field(default_factory=list)
 
 
 class BaseAnalyzer(ABC):

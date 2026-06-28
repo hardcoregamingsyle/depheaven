@@ -85,6 +85,38 @@ def _render_result(result: AnalysisResult) -> bool:
     return any(d.status != "ok" for d in deps)
 
 
+def _render_insights(result: AnalysisResult) -> None:
+    """Print changelog insights and codemod results for a file's deps."""
+    if not result.insights:
+        return
+
+    for insight in result.insights:
+        header = (f"[bold]{insight.package}[/bold] "
+                  f"[dim]{insight.from_version}[/dim] → [cyan]{insight.to_version}[/cyan]")
+        if insight.ollama_used:
+            header += " [dim](Ollama)[/dim]"
+
+        _echo(f"\n  {header}")
+
+        if insight.changelog_summary:
+            _echo(f"    [dim]Summary:[/dim] {insight.changelog_summary}")
+
+        if insight.api_changes:
+            _echo("    [yellow]API changes:[/yellow]")
+            for change in insight.api_changes[:6]:
+                _echo(f"      • {change}")
+
+        if insight.codemod_changes:
+            _echo("    [green]Auto-fixed:[/green]")
+            for change in insight.codemod_changes:
+                _echo(f"      ✓ {change}")
+
+        if insight.migration_steps:
+            _echo("    [cyan]Migration steps:[/cyan]")
+            for i, step in enumerate(insight.migration_steps[:5], 1):
+                _echo(f"      {i}. {step}")
+
+
 @click.group(invoke_without_command=True)
 @click.version_option(__version__, prog_name="heaven")
 @click.pass_context
@@ -105,27 +137,52 @@ def main(ctx):
 @click.option("--yes", "-y", is_flag=True, help="Apply fixes without prompting.")
 @click.option("--dry-run", "-n", is_flag=True, help="Show what would change but don't write.")
 @click.option("--verbose", "-v", is_flag=True, help="Show all deps, not just problems.")
-def dephell(target, yes, dry_run, verbose):
-    """Analyze TARGET (file or directory) and fix its dependencies."""
+@click.option("--deep", is_flag=True,
+              help="Fetch real changelogs + use local Ollama LLM to understand and rewrite code. "
+                   "Requires `ollama serve` running. No API key needed.")
+@click.option("--offline", is_flag=True, help="Skip all network requests.")
+def dephell(target, yes, dry_run, verbose, deep, offline):
+    """Analyze TARGET (file or directory) and fix its dependencies.
+
+    \b
+    Modes:
+      default   Registry version checks + known breaking-change database
+      --deep    + real changelog fetching + local Ollama LLM (no API key)
+      --offline Static analysis only (no network)
+    """
     path = Path(target).resolve()
 
     if HAS_RICH:
+        mode_tag = "[bold yellow] --deep[/bold yellow]" if deep else ""
         console.print(Panel.fit(
-            f"[bold magenta]DepHeaven[/bold magenta] [dim]v{__version__}[/dim]  "
+            f"[bold magenta]DepHeaven[/bold magenta] [dim]v{__version__}[/dim]{mode_tag}  "
             f"[cyan]analyzing[/cyan] [bold]{path}[/bold]",
             border_style="magenta",
         ))
     else:
         click.echo(f"\nDepHeaven v{__version__} — analyzing {path}\n")
 
+    if deep and not offline:
+        try:
+            from . import ollama_client
+            if ollama_client.is_available():
+                model = ollama_client.best_model()
+                _echo(f"  [green]Ollama detected[/green] — using model [bold]{model}[/bold]")
+            else:
+                _echo("  [yellow]--deep requested but Ollama is not running.[/yellow] "
+                      "Start it with: [bold]ollama serve[/bold]  "
+                      "Continuing with changelog-only analysis.")
+        except Exception:
+            pass
+
     if path.is_file():
-        r = analyze_file(path)
+        r = analyze_file(path, offline=offline, deep=deep)
         if r is None:
             _echo(f"[red]Unsupported file type:[/red] {path.suffix}")
             sys.exit(1)
         results = [r]
     else:
-        results = analyze_directory(path)
+        results = analyze_directory(path, offline=offline, deep=deep)
         if not results:
             _echo("[yellow]No supported source files found.[/yellow]")
             sys.exit(0)
@@ -134,6 +191,7 @@ def dephell(target, yes, dry_run, verbose):
     for result in results:
         if verbose or any(d.status != "ok" for d in result.dependencies):
             any_issues = _render_result(result) or any_issues
+            _render_insights(result)
 
     if not any_issues:
         _echo("\n[green]✓ Everything looks good — no issues found![/green]")
