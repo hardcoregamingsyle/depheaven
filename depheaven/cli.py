@@ -237,11 +237,185 @@ def dephell(target, yes, dry_run, verbose, offline):
     )
 
 
-# Support: heaven {path} dephell  (path before subcommand)
+@main.command("graphcheck")
+@click.argument("target", type=click.Path(exists=True))
+@click.option("--depth", "-d", default=4, show_default=True,
+              help="How many levels deep to trace transitive dependencies.")
+@click.option("--verbose", "-v", is_flag=True, help="Show full dependency tree, not just conflicts.")
+def graphcheck(target, depth, verbose):
+    """Detect deep transitive dependency conflicts in TARGET.
+
+    \b
+    Finds conflicts like:
+      Your code needs A
+      A needs C>=2.0
+      C needs B>=3.0
+      But A also requires B<2.0  ← conflict buried 3 levels deep
+
+    Fetches full transitive dependency trees from PyPI / npm.
+    """
+    from .graph import build_graph, detect_conflicts
+    from .languages.python import PythonAnalyzer
+    from .languages.javascript import JavaScriptAnalyzer
+
+    path = Path(target).resolve()
+
+    if HAS_RICH:
+        console.print(Panel.fit(
+            f"[bold magenta]DepHeaven[/bold magenta] [bold cyan]graphcheck[/bold cyan]  "
+            f"[dim]depth={depth}[/dim]  [bold]{path}[/bold]",
+            border_style="cyan",
+        ))
+    else:
+        click.echo(f"\nDepHeaven graphcheck — {path} (depth {depth})\n")
+
+    # Find the manifest for this path
+    manifest_path = None
+    ecosystem = "python"
+
+    py = PythonAnalyzer()
+    js = JavaScriptAnalyzer()
+
+    check_path = path if path.is_dir() else path.parent
+    # Search only within the target directory (don't walk above it)
+    for name in ("requirements.txt", "pyproject.toml", "Pipfile", "package.json"):
+        c = check_path / name
+        if c.exists():
+            manifest_path = c
+            break
+
+    if not manifest_path:
+        _echo("[red]No manifest found (requirements.txt / package.json).[/red]")
+        raise SystemExit(1)
+
+    _echo(f"  [dim]manifest:[/dim] [bold]{manifest_path}[/bold]")
+
+    # Parse manifest to get root packages
+    if manifest_path.name == "package.json":
+        ecosystem = "npm"
+        root_packages = _parse_package_json_deps(manifest_path)
+    else:
+        ecosystem = "python"
+        root_packages = py.parse_manifest(manifest_path)
+
+    if not root_packages:
+        _echo("[yellow]No dependencies found in manifest.[/yellow]")
+        raise SystemExit(0)
+
+    _echo(f"  [dim]{len(root_packages)} root packages, tracing {depth} levels deep...[/dim]\n")
+
+    # Build graph
+    graph = build_graph(root_packages, ecosystem=ecosystem, max_depth=depth)
+
+    total_nodes = len(graph.nodes)
+    total_edges = len(graph.edges)
+    _echo(f"  [dim]Graph built: {total_nodes} packages, {total_edges} edges[/dim]\n")
+
+    # Optional: print tree
+    if verbose:
+        _render_tree(graph, root_packages)
+
+    # Detect conflicts
+    conflicts = detect_conflicts(graph, ecosystem=ecosystem)
+
+    if not conflicts:
+        _echo("[bold green]✓ No transitive dependency conflicts detected.[/bold green]")
+        raise SystemExit(0)
+
+    _echo(f"[bold red]✗ {len(conflicts)} conflict(s) detected:[/bold red]\n")
+
+    for i, conflict in enumerate(conflicts, 1):
+        _render_conflict(i, conflict)
+
+    raise SystemExit(1)
+
+
+def _parse_package_json_deps(manifest_path: Path) -> dict[str, str]:
+    import json
+    try:
+        data = json.loads(manifest_path.read_text())
+        deps = {}
+        for section in ("dependencies", "devDependencies"):
+            for name, ver in (data.get(section) or {}).items():
+                deps[name] = ver.lstrip("^~>=<! ")
+        return deps
+    except Exception:
+        return {}
+
+
+def _render_tree(graph, root_packages: dict[str, str]) -> None:
+    """Print a simple indented dependency tree."""
+    _echo("[bold]Dependency tree:[/bold]")
+    from collections import defaultdict
+    adj: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for src, dst, spec in graph.edges:
+        adj[src].append((dst, spec))
+
+    visited: set[str] = set()
+
+    def _print_node(name: str, spec: str, indent: int) -> None:
+        key = name.lower().replace("-", "_")
+        node = graph.get_node(key)
+        ver = node.version if node else "?"
+        prefix = "  " * indent
+        marker = "[dim](already shown)[/dim]" if key in visited else ""
+        color = "yellow" if node and node.fetch_error else "white"
+        _echo(f"{prefix}[{color}]{name}[/{color}] [dim]{ver}[/dim] [dim]{spec}[/dim] {marker}")
+        if key in visited:
+            return
+        visited.add(key)
+        for dep_name, dep_spec in adj.get(key, [])[:10]:  # limit width
+            _print_node(dep_name, dep_spec, indent + 1)
+
+    for pkg in root_packages:
+        _print_node(pkg, "", 0)
+    _echo("")
+
+
+def _render_conflict(i: int, conflict) -> None:
+    """Render a single ConflictChain."""
+    pkg = conflict.package
+    reqs = conflict.requirements
+
+    if HAS_RICH:
+        if conflict.conflict_type == "manifest_pin_conflict":
+            title = f"[bold red]Conflict {i}:[/bold red] [bold]{pkg}[/bold] — your pin vs transitive requirement"
+        else:
+            title = f"[bold red]Conflict {i}:[/bold red] [bold]{pkg}[/bold] — incompatible version requirements"
+        console.print(title)
+
+        # Show each requirement chain
+        for requirer, spec, resolved in reqs:
+            _echo(f"  [yellow]•[/yellow] [bold]{requirer}[/bold] requires [cyan]{pkg}{spec}[/cyan]")
+
+        # Show the conflict chains (how we got there)
+        if conflict.path_a and len(conflict.path_a) > 1:
+            chain_a = " → ".join(conflict.path_a)
+            _echo(f"    [dim]path: {chain_a}[/dim]")
+        if conflict.path_b and len(conflict.path_b) > 1:
+            chain_b = " → ".join(conflict.path_b)
+            _echo(f"    [dim]path: {chain_b}[/dim]")
+
+        # Resolution
+        if conflict.suggestion:
+            _echo(f"\n  [green]Resolution:[/green]")
+            for line in conflict.suggestion.splitlines():
+                _echo(f"  {line}")
+        _echo("")
+    else:
+        click.echo(f"\nConflict {i}: {pkg}")
+        for requirer, spec, resolved in reqs:
+            click.echo(f"  {requirer} requires {pkg}{spec}")
+        if conflict.suggestion:
+            click.echo(f"  Fix: {conflict.suggestion}")
+
+
+# Support: heaven {path} dephell  OR  heaven {path} graphcheck  (path before subcommand)
 class _ReorderGroup(click.Group):
     def parse_args(self, ctx, args):
-        if len(args) >= 2 and args[1] == "dephell" and not args[0].startswith("-"):
-            args = ["dephell", args[0]] + list(args[2:])
+        subcmds = {"dephell", "graphcheck"}
+        if len(args) >= 2 and args[1] in subcmds and not args[0].startswith("-"):
+            args = [args[1], args[0]] + list(args[2:])
         return super().parse_args(ctx, args)
 
 
