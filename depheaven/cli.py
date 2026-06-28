@@ -241,9 +241,12 @@ def dephell(target, yes, dry_run, verbose, offline):
 @click.argument("target", type=click.Path(exists=True))
 @click.option("--depth", "-d", default=4, show_default=True,
               help="How many levels deep to trace transitive dependencies.")
-@click.option("--verbose", "-v", is_flag=True, help="Show full dependency tree, not just conflicts.")
-def graphcheck(target, depth, verbose):
-    """Detect deep transitive dependency conflicts in TARGET.
+@click.option("--fix", is_flag=True,
+              help="Attempt to resolve conflicts and rewrite the manifest.")
+@click.option("--yes", "-y", is_flag=True, help="Apply fixes without prompting.")
+@click.option("--verbose", "-v", is_flag=True, help="Show full dependency tree.")
+def graphcheck(target, depth, fix, yes, verbose):
+    """Detect (and optionally fix) deep transitive dependency conflicts.
 
     \b
     Finds conflicts like:
@@ -252,7 +255,9 @@ def graphcheck(target, depth, verbose):
       C needs B>=3.0
       But A also requires B<2.0  ← conflict buried 3 levels deep
 
-    Fetches full transitive dependency trees from PyPI / npm.
+    With --fix: finds a version of B that satisfies all constraints,
+    or upgrades A/C until their constraints are compatible, then
+    rewrites your manifest.
     """
     from .graph import build_graph, detect_conflicts
     from .languages.python import PythonAnalyzer
@@ -323,11 +328,61 @@ def graphcheck(target, depth, verbose):
         raise SystemExit(0)
 
     _echo(f"[bold red]✗ {len(conflicts)} conflict(s) detected:[/bold red]\n")
-
     for i, conflict in enumerate(conflicts, 1):
         _render_conflict(i, conflict)
 
-    raise SystemExit(1)
+    if not fix:
+        _echo("\n[dim]Run with [bold]--fix[/bold] to attempt automatic resolution.[/dim]")
+        raise SystemExit(1)
+
+    # ── Resolution ────────────────────────────────────────────────────────────
+    from .graph import resolve_all, apply_resolutions
+
+    _echo(f"\n[bold cyan]Resolving {len(conflicts)} conflict(s)...[/bold cyan]")
+    _echo("[dim](fetching version histories — may take a moment)[/dim]\n")
+
+    resolutions = resolve_all(conflicts, graph, ecosystem=ecosystem)
+
+    resolved_count = sum(1 for r in resolutions if r.status == "resolved")
+    upgrade_count = sum(1 for r in resolutions if r.status == "upgrade_required")
+    unresolvable_count = sum(1 for r in resolutions if r.status == "unresolvable")
+
+    for res in resolutions:
+        _render_resolution(res)
+
+    if not any(r.status in ("resolved", "upgrade_required") for r in resolutions):
+        _echo("\n[red]No conflicts could be resolved automatically.[/red]")
+        raise SystemExit(1)
+
+    # Collect all manifest changes
+    all_changes: dict[str, str] = {}
+    for res in resolutions:
+        all_changes.update(res.manifest_changes)
+
+    _echo(f"\n[bold]Changes to apply to [cyan]{manifest_path.name}[/cyan]:[/bold]")
+    for pkg, ver in sorted(all_changes.items()):
+        _echo(f"  [cyan]{pkg}[/cyan] → [green]{ver}[/green]")
+
+    if not yes:
+        click.confirm("\nApply these changes?", default=True, abort=True)
+
+    outcome = apply_resolutions(resolutions, manifest_path, ecosystem=ecosystem)
+
+    if outcome["updated"]:
+        _echo(f"\n[bold green]✓ Updated {len(outcome['updated'])} package(s) in {manifest_path.name}[/bold green]")
+        for u in outcome["updated"]:
+            _echo(f"  • {u}")
+
+    if outcome["unresolvable"]:
+        _echo(f"\n[yellow]⚠  {len(outcome['unresolvable'])} conflict(s) could not be auto-resolved:[/yellow]")
+        for u in outcome["unresolvable"]:
+            _echo(f"  • {u}")
+
+    if resolved_count + upgrade_count > 0:
+        pm = "pip install -r requirements.txt" if ecosystem == "python" else "npm install"
+        _echo(f"\n[dim]Run [bold]{pm}[/bold] to install the resolved versions.[/dim]")
+
+    raise SystemExit(0 if not outcome["unresolvable"] else 1)
 
 
 def _parse_package_json_deps(manifest_path: Path) -> dict[str, str]:
@@ -370,6 +425,28 @@ def _render_tree(graph, root_packages: dict[str, str]) -> None:
     for pkg in root_packages:
         _print_node(pkg, "", 0)
     _echo("")
+
+
+def _render_resolution(res) -> None:
+    """Print the result of attempting to resolve one conflict."""
+    pkg = res.conflict.package
+    if res.status == "resolved":
+        _echo(
+            f"  [green]✓[/green] [bold]{pkg}[/bold] — "
+            f"version [cyan]{res.resolved_version}[/cyan] satisfies all constraints"
+        )
+    elif res.status == "upgrade_required":
+        _echo(
+            f"  [yellow]↑[/yellow] [bold]{pkg}[/bold] — "
+            f"no single version works as-is; upgrade [bold]{res.upgrade_package}[/bold] "
+            f"to [cyan]{res.upgrade_to}[/cyan] (relaxes constraint to "
+            f"[dim]{res.upgrade_relaxes_constraint}[/dim]), "
+            f"then pin [bold]{pkg}[/bold] at [cyan]{res.resolved_version}[/cyan]"
+        )
+    else:
+        _echo(
+            f"  [red]✗[/red] [bold]{pkg}[/bold] — unresolvable: {res.reason}"
+        )
 
 
 def _render_conflict(i: int, conflict) -> None:

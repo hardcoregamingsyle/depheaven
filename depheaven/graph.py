@@ -528,11 +528,381 @@ def _suggest_resolution(
     src_a: str, src_b: str,
     ecosystem: str,
 ) -> str:
-    pm = "pip install" if ecosystem == "python" else "npm install"
     return (
         f"`{src_a}` requires `{pkg}{spec_a}` but `{src_b}` requires `{pkg}{spec_b}`. "
         f"These cannot be satisfied simultaneously. Options:\n"
         f"  1. Downgrade `{src_a}` or `{src_b}` to versions that agree on `{pkg}`\n"
         f"  2. Check if `{src_a}` or `{src_b}` have a newer release that relaxed this constraint\n"
         f"  3. Search for the conflict: `{pkg}` changelog between the two required ranges"
+    )
+
+
+# ── Resolution engine ─────────────────────────────────────────────────────────
+
+@dataclass
+class Resolution:
+    """The outcome of attempting to resolve a conflict."""
+    conflict: ConflictChain
+    status: str          # "resolved" | "upgrade_required" | "unresolvable"
+    # For "resolved": a version of the conflicting package that satisfies everyone
+    resolved_version: Optional[str] = None
+    # For "upgrade_required": which requirer to upgrade and to what version
+    upgrade_package: Optional[str] = None
+    upgrade_to: Optional[str] = None
+    upgrade_relaxes_constraint: Optional[str] = None  # the new (relaxed) specifier
+    # For "unresolvable": why
+    reason: Optional[str] = None
+    # Manifest changes to write
+    manifest_changes: dict[str, str] = field(default_factory=dict)  # {pkg: version}
+
+
+def resolve_all(
+    conflicts: list[ConflictChain],
+    graph: DependencyGraph,
+    ecosystem: str = "python",
+) -> list[Resolution]:
+    """
+    Attempt to resolve every conflict.
+    Returns a Resolution for each conflict.
+    """
+    resolutions: list[Resolution] = []
+
+    # Collect ALL constraints from transitive edges only.
+    # We deliberately exclude the manifest pins — those are what we're trying to fix.
+    all_constraints: dict[str, list[str]] = defaultdict(list)
+    root_keys = {k.lower().replace("-", "_") for k in graph.root_packages}
+    for src, dst, spec in graph.edges:
+        if spec:
+            # Skip edges that originate from a root package pinning itself
+            src_key = src.lower().replace("-", "_")
+            dst_key = dst.lower().replace("-", "_")
+            if src_key in root_keys and dst_key in root_keys:
+                continue  # manifest-to-manifest: skip, we'll rewrite both
+            all_constraints[dst].append(spec)
+
+    for conflict in conflicts:
+        res = _resolve_one(conflict, all_constraints, graph, ecosystem)
+        resolutions.append(res)
+
+    return resolutions
+
+
+def _resolve_one(
+    conflict: ConflictChain,
+    all_constraints: dict[str, list[str]],
+    graph: DependencyGraph,
+    ecosystem: str,
+) -> Resolution:
+    pkg = conflict.package
+
+    # For manifest_pin_conflict: the manifest pin IS the problem — exclude it
+    # and find a version satisfying only the transitive requirements
+    if conflict.conflict_type == "manifest_pin_conflict":
+        transitive_specs = [
+            spec for (requirer, spec, _) in conflict.requirements
+            if requirer != "your manifest"
+        ]
+        # Add any other transitive constraints on this package
+        extra = [s for s in all_constraints.get(pkg, [])
+                 if "extra ==" not in s]  # skip optional extras
+        constraints = list(set(transitive_specs + extra))
+    else:
+        constraints = list(set(all_constraints.get(pkg, [])))
+
+    # Filter out marker-only constraints (no version info)
+    constraints = [c for c in constraints if c and any(ch.isdigit() for ch in c)]
+
+    # 1. Try to find a version of `pkg` that satisfies all constraints at once
+    compatible = _find_compatible_version(pkg, constraints, ecosystem)
+
+    if compatible:
+        return Resolution(
+            conflict=conflict,
+            status="resolved",
+            resolved_version=compatible,
+            manifest_changes={pkg: compatible},
+        )
+
+    # 2. No single version works — find which requirer to upgrade
+    # Strategy: for each requirer that is a direct dependency (in root_packages),
+    # check if its newer versions have a more relaxed constraint on `pkg`
+    for requirer, spec, _ in conflict.requirements:
+        if requirer == "your manifest":
+            continue
+        norm_req = requirer.lower().replace("-", "_")
+        if norm_req not in {k.lower().replace("-", "_") for k in graph.root_packages}:
+            continue  # not a direct dep — can't easily upgrade it
+
+        upgrade_ver, new_spec = _find_upgrader(requirer, pkg, spec, ecosystem)
+        if upgrade_ver and new_spec:
+            # Re-check: does upgrading this requirer resolve the conflict?
+            test_constraints = [c for c in constraints if c != spec] + [new_spec]
+            retry = _find_compatible_version(pkg, test_constraints, ecosystem)
+            if retry:
+                return Resolution(
+                    conflict=conflict,
+                    status="upgrade_required",
+                    upgrade_package=requirer,
+                    upgrade_to=upgrade_ver,
+                    upgrade_relaxes_constraint=new_spec,
+                    resolved_version=retry,
+                    manifest_changes={requirer: upgrade_ver, pkg: retry},
+                )
+
+    return Resolution(
+        conflict=conflict,
+        status="unresolvable",
+        reason=(
+            f"No version of `{pkg}` satisfies all constraints simultaneously, "
+            f"and no upgrade of a direct dependency was found that relaxes them. "
+            f"You may need to fork a dependency or vendor it."
+        ),
+    )
+
+
+def _find_compatible_version(
+    package: str,
+    constraints: list[str],
+    ecosystem: str,
+) -> Optional[str]:
+    """
+    Fetch all released versions of `package` and return the highest one
+    that satisfies every constraint in `constraints`.
+    """
+    versions = _fetch_all_versions(package, ecosystem)
+    if not versions:
+        return None
+
+    if ecosystem == "python":
+        return _best_python_version(versions, constraints)
+    else:
+        return _best_npm_version(versions, constraints)
+
+
+def _best_python_version(versions: list[str], constraints: list[str]) -> Optional[str]:
+    try:
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import Version
+
+        combined = SpecifierSet(",".join(constraints), prereleases=False)
+        candidates = []
+        for v in versions:
+            try:
+                vv = Version(v)
+                if not vv.is_prerelease and vv in combined:
+                    candidates.append(vv)
+            except Exception:
+                continue
+        return str(max(candidates)) if candidates else None
+    except Exception:
+        return None
+
+
+def _best_npm_version(versions: list[str], constraints: list[str]) -> Optional[str]:
+    """Find highest npm version satisfying all constraints."""
+    # Parse constraints to get required major versions
+    required_majors: set[int] = set()
+    min_ver = (0, 0, 0)
+
+    for spec in constraints:
+        spec = spec.strip()
+        # caret: ^X.Y.Z → major must equal X
+        m = re.match(r"^\^(\d+)", spec)
+        if m:
+            required_majors.add(int(m.group(1)))
+            continue
+        # tilde: ~X.Y → major must equal X
+        m = re.match(r"^~(\d+)", spec)
+        if m:
+            required_majors.add(int(m.group(1)))
+            continue
+        # exact: X.Y.Z or ==X.Y.Z
+        m = re.match(r"^=?=?(\d+)\.(\d+)\.?(\d*)", spec.lstrip("v"))
+        if m:
+            required_majors.add(int(m.group(1)))
+
+    if len(required_majors) > 1:
+        return None  # conflicting majors — truly incompatible
+
+    def parse_semver(v: str) -> tuple[int, int, int]:
+        parts = re.sub(r"[^0-9.]", "", v).split(".")
+        try:
+            return (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0,
+                    int(parts[2]) if len(parts) > 2 else 0)
+        except (ValueError, IndexError):
+            return (0, 0, 0)
+
+    target_major = next(iter(required_majors)) if required_majors else None
+    candidates = []
+    for v in versions:
+        parsed = parse_semver(v)
+        if "-" in v:  # skip pre-releases
+            continue
+        if target_major is not None and parsed[0] != target_major:
+            continue
+        candidates.append((parsed, v))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda x: x[0])[1]
+
+
+def _fetch_all_versions(package: str, ecosystem: str) -> list[str]:
+    """Fetch all released versions of a package."""
+    if ecosystem == "python":
+        data = _get_json(f"https://pypi.org/pypi/{package}/json")
+        if not data:
+            return []
+        return list((data.get("releases") or {}).keys())
+    else:
+        encoded = package.replace("/", "%2F")
+        data = _get_json(f"https://registry.npmjs.org/{encoded}")
+        if not data:
+            return []
+        return list((data.get("versions") or {}).keys())
+
+
+def _find_upgrader(
+    requirer: str,
+    conflicting_pkg: str,
+    current_spec: str,
+    ecosystem: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Check if a newer version of `requirer` has a more relaxed constraint on
+    `conflicting_pkg`. Returns (upgrade_version, new_specifier) or (None, None).
+    """
+    versions = _fetch_all_versions(requirer, ecosystem)
+    if not versions:
+        return None, None
+
+    # Sort versions descending and check each newer release
+    def ver_key(v: str) -> tuple:
+        parts = re.sub(r"[^0-9.]", "", v).split(".")
+        try:
+            return tuple(int(x) for x in parts[:3])
+        except ValueError:
+            return (0,)
+
+    try:
+        sorted_vers = sorted(
+            [v for v in versions if "-" not in v],
+            key=ver_key,
+            reverse=True,
+        )
+    except Exception:
+        return None, None
+
+    for ver in sorted_vers[:15]:  # check top 15 newer releases
+        if ecosystem == "python":
+            meta = fetch_pypi_metadata(requirer, ver)
+        else:
+            meta = fetch_npm_metadata(requirer, ver)
+
+        if not meta:
+            continue
+
+        for req in meta.requires:
+            norm = req.name.lower().replace("-", "_")
+            if norm == conflicting_pkg.lower().replace("-", "_"):
+                if req.specifier != current_spec:
+                    return ver, req.specifier
+
+    return None, None
+
+
+# ── Apply resolutions to manifest files ───────────────────────────────────────
+
+def apply_resolutions(
+    resolutions: list[Resolution],
+    manifest_path,
+    ecosystem: str,
+) -> dict[str, list[str]]:
+    """
+    Write resolved versions back to the manifest file.
+    Returns {"updated": [...], "skipped": [...], "unresolvable": [...]}.
+    """
+    import re as _re
+    from pathlib import Path
+
+    manifest_path = Path(manifest_path)
+    outcome = {"updated": [], "skipped": [], "unresolvable": []}
+
+    # Collect all changes: {pkg_name: version}
+    all_changes: dict[str, str] = {}
+    for res in resolutions:
+        if res.status in ("resolved", "upgrade_required"):
+            all_changes.update(res.manifest_changes)
+        else:
+            outcome["unresolvable"].append(res.conflict.package)
+
+    if not all_changes:
+        return outcome
+
+    if ecosystem == "python":
+        _apply_python_manifest(manifest_path, all_changes, outcome)
+    else:
+        _apply_npm_manifest(manifest_path, all_changes, outcome)
+
+    return outcome
+
+
+def _apply_python_manifest(manifest_path, changes: dict[str, str], outcome: dict) -> None:
+    import re
+    text = manifest_path.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+    new_lines = []
+    updated: set[str] = set()
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            new_lines.append(line)
+            continue
+        m = re.match(r"^([\w\-\.]+)", stripped)
+        if m:
+            key = m.group(1).lower().replace("-", "_")
+            if key in {k.lower().replace("-", "_") for k in changes}:
+                # Find matching key
+                match_key = next(k for k in changes
+                                 if k.lower().replace("-", "_") == key)
+                new_ver = changes[match_key]
+                extras_m = re.match(r"^([\w\-\.]+)(\[[^\]]+\])?", stripped)
+                pkg_name = m.group(1)
+                extras = extras_m.group(2) or "" if extras_m else ""
+                new_lines.append(f"{pkg_name}{extras}=={new_ver}\n")
+                outcome["updated"].append(f"{pkg_name}=={new_ver}")
+                updated.add(key)
+                continue
+        new_lines.append(line)
+
+    # Add packages not already in manifest
+    existing = {re.match(r"^([\w\-\.]+)", l.strip()).group(1).lower().replace("-", "_")
+                for l in lines if l.strip() and not l.strip().startswith("#")
+                and re.match(r"^([\w\-\.]+)", l.strip())}
+    for pkg, ver in changes.items():
+        key = pkg.lower().replace("-", "_")
+        if key not in existing and key not in updated:
+            new_lines.append(f"{pkg}=={ver}\n")
+            outcome["updated"].append(f"{pkg}=={ver} (added)")
+
+    manifest_path.write_text("".join(new_lines), encoding="utf-8")
+
+
+def _apply_npm_manifest(manifest_path, changes: dict[str, str], outcome: dict) -> None:
+    import json
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    for section in ("dependencies", "devDependencies"):
+        if section not in data:
+            continue
+        for pkg in list(data[section].keys()):
+            key = pkg.lower()
+            match = next((k for k in changes if k.lower() == key), None)
+            if match:
+                data[section][pkg] = changes[match]
+                outcome["updated"].append(f"{pkg}=={changes[match]}")
+
+    manifest_path.write_text(
+        json.dumps(data, indent=2) + "\n", encoding="utf-8"
     )
