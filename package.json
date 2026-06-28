@@ -1,0 +1,23 @@
+{
+  "name": "depheaven",
+  "version": "0.1.0",
+  "description": "Dependency Hell Fixer — analyze and auto-fix import/dependency issues across languages",
+  "keywords": ["dependencies", "imports", "devtools", "cli"],
+  "license": "MIT",
+  "bin": {
+    "heaven": "./bin/heaven.js"
+  },
+  "scripts": {
+    "test": "node bin/heaven.js --version"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/depheaven/depheaven"
+  },
+  "files": [
+    "bin/"
+  ]
+}

@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "depheaven"
+version = "0.1.0"
+description = "Dependency Hell Fixer — analyze and auto-fix import/dependency issues across languages"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "DepHeaven Contributors" }]
+keywords = ["dependencies", "imports", "packaging", "cli", "devtools"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Utilities",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "click>=8.0",
+    "rich>=13.0",
+    "httpx>=0.24",
+]
+
+[project.scripts]
+heaven = "depheaven.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/depheaven/depheaven"
+Repository = "https://github.com/depheaven/depheaven"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["depheaven*"]
+
+[tool.setuptools.package-data]
+"*" = ["py.typed"]
